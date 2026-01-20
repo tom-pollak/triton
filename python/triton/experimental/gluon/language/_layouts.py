@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 import itertools
 from typing import List
 
 from triton.language.core import _unwrap_if_constexpr, _unwrap_shape, constexpr_type
 from triton.runtime.jit import constexpr_function
+from triton.tools import LinearLayout
 import math
 
 
@@ -210,6 +213,50 @@ class DistributedLinearLayout(DistributedLayout):
     @property
     def rank(self):
         return len(self.shape)
+
+    def to_linear_layout(self) -> LinearLayout:
+        bases = []
+        for name, b in [("register", self.reg_bases), ("lane", self.lane_bases), ("warp", self.warp_bases),
+                        ("block", self.block_bases)]:
+            if b:  # Only include non-empty bases
+                bases.append((name, b))
+
+        out_dim_names = [f"dim{i}" for i in range(len(self.shape))]
+        return LinearLayout.from_bases(bases, out_dim_names, self.shape, require_surjective=False)
+
+    @staticmethod
+    def from_linear_layout(ll: LinearLayout) -> DistributedLinearLayout:
+        """
+        The LinearLayout must have input dimensions from {"register", "lane", "warp", "block"}
+        and output dimensions named "dim0", "dim1", etc.
+        """
+        bases_dict = dict(ll.bases)
+        out_dims_dict = dict(ll.out_dims)
+        shape = [out_dims_dict[f"dim{i}"] for i in range(ll.num_out_dims)]
+        return DistributedLinearLayout(
+            reg_bases=bases_dict.get("register", []),
+            lane_bases=bases_dict.get("lane", []),
+            warp_bases=bases_dict.get("warp", []),
+            block_bases=bases_dict.get("block", []),
+            shape=shape,
+        )
+
+    def tile(self, new_shape: list[int]) -> DistributedLinearLayout:
+        """Tile to larger shape by adding register bases."""
+        assert self.rank == len(new_shape), f"layout rank={self.rank} must match rank of new_shape={len(new_shape)}"
+        ll = self.to_linear_layout()
+        for i, (old_sz, new_sz) in enumerate(zip(self.shape, new_shape)):
+            assert new_sz >= old_sz and new_sz % old_sz == 0, \
+                f"new_shape[{i}]={new_sz} must be >= and divisible by shape[{i}]={old_sz}"
+            ll *= LinearLayout.identity_1d(new_sz // old_sz, "register", f"dim{i}")
+        return DistributedLinearLayout.from_linear_layout(ll)
+
+    def __mul__(self, other: DistributedLinearLayout) -> DistributedLinearLayout:
+        """Product of two layouts."""
+        return DistributedLinearLayout.from_linear_layout(self.to_linear_layout() * other.to_linear_layout())
+
+    def invert(self) -> LinearLayout:
+        return self.to_linear_layout().invert()
 
 
 @dataclass(frozen=True)
